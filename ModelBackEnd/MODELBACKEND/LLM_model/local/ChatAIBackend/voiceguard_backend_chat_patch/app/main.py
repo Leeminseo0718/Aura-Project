@@ -65,7 +65,7 @@ class Report(BaseModel):
 class ChatSource(BaseModel):
     source: str
     doc_id: Optional[str]
-    chunk_id: Optional[str]
+    chunk_id: Optional[int]  # rag.DocChunk.chunk_id 가 int
 
 class ChatResponse(BaseModel):
     answer: str

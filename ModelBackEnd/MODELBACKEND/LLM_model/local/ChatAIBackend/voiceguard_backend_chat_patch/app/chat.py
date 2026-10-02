@@ -5,12 +5,13 @@ from typing import List, Dict, Any, Optional
 import httpx
 
 from .rag import RAGIndex
-from llama_cpp import Llama
 
 # ======= Optional dual-model routing (PRIMARY/SECONDARY with ROUTING) =======
 PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen2.5-7b-instruct-q6_k_l")
 SECONDARY_MODEL = os.getenv("SECONDARY_MODEL", "llama3.1:8b")
 ROUTING = os.getenv("ROUTING", "auto")  # auto | qwen | llama
+# LLM에 함께 보낼 최근 대화 개수 (프론트가 history를 계속 누적해서 보내므로 제한)
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
 
 def _is_korean(text: str, threshold: float = 0.2) -> bool:
     if not text:
@@ -47,19 +48,34 @@ def build_context_from_chunks(chunks) -> str:
         out.append(f"[{c.source}] {c.text}")
     return "\n\n".join(out)
 
-def _openai_chat(user_query: str, model: str, base_url: str, api_key: str) -> str:
+def _clean_history(history) -> List[Dict[str, str]]:
+    """클라이언트가 보낸 history에서 올바른 user/assistant 메시지만 최근 N개 남김"""
+    cleaned = []
+    for m in history or []:
+        if not isinstance(m, dict):
+            continue
+        role, content = m.get("role"), m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content})
+    return cleaned[-MAX_HISTORY_MESSAGES:] if MAX_HISTORY_MESSAGES > 0 else []
+
+def build_messages(user_query: str, context: str, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """시스템 프롬프트(+RAG 검색 결과) → 이전 대화 → 이번 질문 순서로 메시지 구성"""
+    system = SYSTEM_PROMPT
+    if context:
+        system += "\n\n컨텍스트:\n" + context
+    return [{"role": "system", "content": system}, *history, {"role": "user", "content": user_query}]
+
+def _openai_chat(messages: List[Dict[str, str]], model: str, base_url: str, api_key: str) -> str:
     """
-    llama.cpp 서버용 한국어 강제 프롬프트 전달 (ChatML)
+    OpenAI 호환 서버(Ollama, llama.cpp 등)에 chat completions 요청
     """
     url = base_url.rstrip("/") + "/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_query}
-        ],
+        "messages": messages,
         "temperature": 0.2,
         "max_tokens": 512
     }
@@ -103,18 +119,15 @@ class ChatEngine:
         self.api_key = os.getenv("OPENAI_API_KEY", "")
 
     def chat(self, user_query: str, history: Optional[List[Dict[str, str]]] = None, use_rag=True, top_k=4) -> Dict[str, Any]:
-        history = history or []
+        history = _clean_history(history)
         chunks = self.rag.search(user_query, top_k=top_k) if use_rag else []
         context = build_context_from_chunks(chunks)
-        sys = {"role": "system", "content": SYSTEM_PROMPT}
-        if context:
-            prompt_text = SYSTEM_PROMPT + "\n\n컨텍스트:\n" + context + "\n사용자: " + user_query + "\nAI:"
-        else:
-            prompt_text = SYSTEM_PROMPT + "\n\n사용자: " + user_query + "\nAI:"
 
         if self.api_key:
             model_name = _pick_model(user_query, history)
-            answer = _openai_chat(user_query, model_name, self.base_url, self.api_key)
+            # RAG 검색 결과와 이전 대화를 실제로 LLM에 전달
+            messages = build_messages(user_query, context, history)
+            answer = _openai_chat(messages, model_name, self.base_url, self.api_key)
         else:
             answer = f"(로컬 템플릿) 질문 요약: {user_query}\n- 참고한 문서 수: {len(chunks)}"
 
