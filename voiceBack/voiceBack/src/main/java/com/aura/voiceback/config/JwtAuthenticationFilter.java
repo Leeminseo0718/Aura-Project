@@ -6,11 +6,13 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.util.Collections;
 
 @Component
 @RequiredArgsConstructor
@@ -39,8 +41,9 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 // 컨트롤러에서 email 접근 가능하게 저장
                 request.setAttribute("email", email);
 
-                // SecurityContext는 UserDetails 기반으로 세팅 가능 (간단히 비워둬도 동작)
-                SecurityContextHolder.clearContext();
+                // 인증된 사용자로 등록해야 SecurityConfig의 authenticated() 규칙을 통과함
+                SecurityContextHolder.getContext().setAuthentication(
+                        new UsernamePasswordAuthenticationToken(email, null, Collections.emptyList()));
             }
         }
 

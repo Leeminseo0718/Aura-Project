@@ -81,6 +81,32 @@ export const getStoredAccessToken = (): string | null => {
   }
 };
 
+const getStoredRefreshToken = (): string | null => {
+  try {
+    const remember =
+      window.localStorage.getItem(AUTH_STORAGE_KEYS.remember) === "true";
+    const storage = remember ? window.localStorage : window.sessionStorage;
+    return storage.getItem(AUTH_STORAGE_KEYS.refreshToken);
+  } catch {
+    return null;
+  }
+};
+
+// JWT payload의 exp(초)를 읽어 만료가 임박했는지 확인
+const isTokenExpiringSoon = (token: string, marginSec = 60): boolean => {
+  try {
+    const payload = JSON.parse(
+      atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))
+    );
+    return (
+      typeof payload.exp !== "number" ||
+      payload.exp * 1000 - Date.now() < marginSec * 1000
+    );
+  } catch {
+    return true;
+  }
+};
+
 export const authService = {
   async login(
     credentials: Credentials,
@@ -234,4 +260,19 @@ export const authService = {
     }
     return res.text(); // 성공 메시지 반환
   },
+};
+
+// 유효한 액세스 토큰 반환 (만료 임박 시 refresh 토큰으로 재발급)
+export const getValidAccessToken = async (): Promise<string | null> => {
+  const accessToken = getStoredAccessToken();
+  if (accessToken && !isTokenExpiringSoon(accessToken)) return accessToken;
+
+  const refreshToken = getStoredRefreshToken();
+  if (!refreshToken) return accessToken;
+  try {
+    const tokens = await authService.refresh(refreshToken);
+    return tokens.accessToken;
+  } catch {
+    return null;
+  }
 };

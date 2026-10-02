@@ -1,6 +1,7 @@
 package com.aura.voiceback.controller;
 
 import com.aura.voiceback.service.CallSessionManager;
+import com.aura.voiceback.service.VoIPService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -13,6 +14,9 @@ public class CallController {
 
     @Autowired
     private CallSessionManager callSessionManager;
+
+    @Autowired
+    private VoIPService voipService;
 
     /**
      * 1:1 통화 시작 요청
@@ -57,15 +61,15 @@ public class CallController {
     }
 
     /**
-     * 1️⃣ 통화방 생성
-     * body: { "creatorId": "user1", "roomName": "Room A" }
+     * 1️⃣ 통화방 생성 (JWT 필요, 생성자는 로그인한 사용자)
+     * body: { "roomName": "Room A" }
      */
     @PostMapping("/room/create")
-    public ResponseEntity<?> createRoom(@RequestBody Map<String, String> payload) {
-        String creatorId = payload.get("creatorId");
+    public ResponseEntity<?> createRoom(@RequestAttribute("email") String creatorId,
+                                        @RequestBody Map<String, String> payload) {
         String roomName = payload.get("roomName");
-        if (creatorId == null || roomName == null) {
-            return ResponseEntity.badRequest().body(Map.of("error", "creatorId and roomName required"));
+        if (roomName == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "roomName required"));
         }
 
         String roomId = callSessionManager.createRoom(creatorId, roomName);
@@ -93,16 +97,16 @@ public class CallController {
     }
 
     /**
-     * 3️⃣ 통화방 참가
-     * body: { "userId": "user2", "roomId": "..." }
+     * 3️⃣ 통화방 참가 (JWT 필요, 참가자는 로그인한 사용자)
+     * body: { "roomId": "..." }
      */
     @PostMapping("/room/join")
-    public ResponseEntity<?> joinRoom(@RequestBody Map<String, String> payload) {
-        String userId = payload.get("userId");
+    public ResponseEntity<?> joinRoom(@RequestAttribute("email") String userId,
+                                      @RequestBody Map<String, String> payload) {
         String roomId = payload.get("roomId");
 
-        if (userId == null || roomId == null) {
-            return ResponseEntity.badRequest().body(Map.of("error", "userId and roomId required"));
+        if (roomId == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "roomId required"));
         }
 
         boolean joined = callSessionManager.joinRoom(userId, roomId);
@@ -121,16 +125,22 @@ public class CallController {
         ));
     }
 
+    /**
+     * 통화방 나가기 (JWT 필요)
+     * body: { "roomId": "..." }
+     */
     @PostMapping("/room/leave")
-    public ResponseEntity<?> leaveRoom(@RequestBody Map<String, String> payload) {
-        String userId = payload.get("userId");
+    public ResponseEntity<?> leaveRoom(@RequestAttribute("email") String userId,
+                                       @RequestBody Map<String, String> payload) {
         String roomId = payload.get("roomId");
 
-        if (userId == null || roomId == null) {
-            return ResponseEntity.badRequest().body(Map.of("error", "userId and roomId required"));
+        if (roomId == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "roomId required"));
         }
 
         boolean exists = callSessionManager.leaveRoom(userId, roomId);
+        // 나간 사용자의 통화 웹소켓도 끊어서 더 이상 음성을 주고받지 않게 함
+        voipService.closeUserSessions(roomId, userId);
         if (!exists) {
             return ResponseEntity.ok(Map.of(
                     "roomId", roomId,

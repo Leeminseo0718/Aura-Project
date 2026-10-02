@@ -1,8 +1,12 @@
 package com.aura.voiceback.service;
 
+import com.aura.voiceback.websocket.VoIPHandshakeInterceptor;
 import org.springframework.stereotype.Service;
 import org.springframework.web.socket.BinaryMessage;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
+import org.springframework.web.socket.handler.SessionLimitExceededException;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -10,8 +14,11 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class VoIPService {
 
-    // 세션ID -> WebSocketSession
-    private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
+    private static final int SEND_TIME_LIMIT_MS = 5000;
+    private static final int SEND_BUFFER_LIMIT_BYTES = 512 * 1024; // 약 5초 분량, 넘으면 오래된 프레임부터 버림
+
+    // 방ID -> (세션ID -> WebSocketSession)
+    private final Map<String, Map<String, WebSocketSession>> roomSessions = new ConcurrentHashMap<>();
 
     private byte[] convertPCMToWAV(byte[] pcmBytes, int sampleRate, int channels) {
         int byteRate = sampleRate * channels * 2; // 16bit
@@ -82,26 +89,59 @@ public class VoIPService {
     }
 
 
-    public void registerSession(String sessionId, WebSocketSession session) {
-        sessions.put(sessionId, session);
+    public void registerSession(String roomId, WebSocketSession session) {
+        // 같은 세션에 여러 송신자가 동시에 보내도 안전하도록 감싸서 저장 (느린 수신자는 오래된 프레임을 버림)
+        WebSocketSession safeSession = new ConcurrentWebSocketSessionDecorator(
+                session, SEND_TIME_LIMIT_MS, SEND_BUFFER_LIMIT_BYTES,
+                ConcurrentWebSocketSessionDecorator.OverflowStrategy.DROP);
+        roomSessions.computeIfAbsent(roomId, id -> new ConcurrentHashMap<>())
+                .put(session.getId(), safeSession);
     }
 
-    public void removeSession(String sessionId) {
-        sessions.remove(sessionId);
+    public void removeSession(String roomId, String sessionId) {
+        roomSessions.computeIfPresent(roomId, (id, sessions) -> {
+            sessions.remove(sessionId);
+            return sessions.isEmpty() ? null : sessions;
+        });
     }
 
-    // 1:1 중계
-    public void forwardAudio(String senderId, byte[] audioBytes) {
+    // 같은 방의 다른 참가자에게만 중계
+    public void forwardAudio(String roomId, String senderSessionId, byte[] audioBytes) {
+        Map<String, WebSocketSession> sessions = roomSessions.get(roomId);
+        if (sessions == null) return;
+
         // 예: 48000Hz, mono
         byte[] wavBytes = convertPCMToWAV(audioBytes, 48000, 1);
 
-        sessions.values().forEach(s -> {
+        sessions.forEach((sessionId, s) -> {
             try {
-                if (s.isOpen() && !s.getId().equals(senderId)) {
+                if (s.isOpen() && !sessionId.equals(senderSessionId)) {
                     s.sendMessage(new BinaryMessage(wavBytes));
+                }
+            } catch (SessionLimitExceededException e) {
+                // 전송이 너무 오래 막힌 수신자는 연결을 끊어 클라이언트가 재접속하도록 함
+                try {
+                    s.close(CloseStatus.SESSION_NOT_RELIABLE);
+                } catch (Exception ignored) {
                 }
             } catch (Exception e) {
                 e.printStackTrace();
+            }
+        });
+    }
+
+    // 방에서 나간 사용자의 웹소켓 연결 종료
+    public void closeUserSessions(String roomId, String email) {
+        Map<String, WebSocketSession> sessions = roomSessions.get(roomId);
+        if (sessions == null) return;
+
+        sessions.values().forEach(s -> {
+            if (email.equals(s.getAttributes().get(VoIPHandshakeInterceptor.ATTR_EMAIL))) {
+                try {
+                    s.close(CloseStatus.NORMAL);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
             }
         });
     }

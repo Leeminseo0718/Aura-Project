@@ -10,8 +10,8 @@ public class CallSessionManager {
 
     // sessionId -> callerId, calleeId
     private final Map<String, CallSession> sessions = new ConcurrentHashMap<>();
-    // 방 정보 저장
-    private final Map<String, Room> rooms = new HashMap<>();
+    // 방 정보 저장 (REST 요청과 웹소켓 핸드셰이크가 동시에 접근하므로 thread-safe 컬렉션 사용)
+    private final Map<String, Room> rooms = new ConcurrentHashMap<>();
 
     public String createSession(String callerId, String calleeId) {
         String sessionId = UUID.randomUUID().toString();
@@ -39,7 +39,7 @@ public class CallSessionManager {
 
     public String createRoom(String creatorId, String roomName) {
         String roomId = UUID.randomUUID().toString();
-        Room room = new Room(roomId, roomName, new HashSet<>());
+        Room room = new Room(roomId, roomName, ConcurrentHashMap.newKeySet());
         room.getParticipants().add(creatorId);
         rooms.put(roomId, room);
         return roomId;
@@ -58,10 +58,17 @@ public class CallSessionManager {
     }
 
     public boolean joinRoom(String userId, String roomId) {
+        // 방 삭제와 동시에 참가해도 꼬이지 않도록 원자적으로 처리
+        return rooms.computeIfPresent(roomId, (id, room) -> {
+            room.getParticipants().add(userId);
+            return room;
+        }) != null;
+    }
+
+    // 웹소켓 접속 시 해당 방 참가자인지 확인
+    public boolean isParticipant(String roomId, String userId) {
         Room room = rooms.get(roomId);
-        if (room == null) return false;
-        room.getParticipants().add(userId);
-        return true;
+        return room != null && room.getParticipants().contains(userId);
     }
 
     public static class Room {
@@ -81,17 +88,12 @@ public class CallSessionManager {
     }
 
     public boolean leaveRoom(String userId, String roomId) {
-        Room room = rooms.get(roomId);
-        if (room == null) return false;
-
-        room.getParticipants().remove(userId);
-
-        if (room.getParticipants().isEmpty()) {
-            rooms.remove(roomId);
-            return false; // 방 삭제됨
-        }
-
-        return true; // 방은 여전히 존재
+        // 마지막 참가자가 나가면 방 삭제 (null 반환 시 맵에서 제거됨)
+        Room remaining = rooms.computeIfPresent(roomId, (id, room) -> {
+            room.getParticipants().remove(userId);
+            return room.getParticipants().isEmpty() ? null : room;
+        });
+        return remaining != null; // false: 방 삭제됨(또는 원래 없음), true: 방은 여전히 존재
     }
 
     public Room getRoom(String roomId) {

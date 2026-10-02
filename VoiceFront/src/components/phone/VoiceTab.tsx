@@ -4,7 +4,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
-import { authService, MeResponse } from "../../services/api/auth";
+import { getValidAccessToken } from "../../services/api/auth";
 
 interface Room {
   id: string;
@@ -17,7 +17,6 @@ const VoiceTab: React.FC = () => {
   const [aiLogs, setAiLogs] = useState<string[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"stt" | "ai">("stt");
 
   const wsRef = useRef<WebSocket | null>(null); // AI 분석 WS
@@ -130,11 +129,15 @@ const VoiceTab: React.FC = () => {
   };
 
   /** ---------------- 통화용 WS ---------------- */
-  const connectCallWS = (roomId: string) => {
+  const connectCallWS = async (roomId: string) => {
     if (callWsRef.current && callWsRef.current.readyState === WebSocket.OPEN)
       return;
 
-    const url = `${callWsUrl}?roomId=${roomId}`;
+    // 서버가 JWT와 방 참가 여부를 확인함 (브라우저 WebSocket은 헤더를 못 붙여서 쿼리로 전달)
+    const token = await getValidAccessToken();
+    const url = `${callWsUrl}?roomId=${encodeURIComponent(
+      roomId
+    )}&token=${encodeURIComponent(token ?? "")}`;
     callWsRef.current = new WebSocket(url);
 
     callWsRef.current.onopen = () =>
@@ -290,11 +293,25 @@ const VoiceTab: React.FC = () => {
     }
   };
 
+  /** ---------------- 통화방 API (JWT 필요) ---------------- */
+  const callApi = async (path: string, body?: object) => {
+    const token = await getValidAccessToken();
+    const res = await fetch(`${CALL_API_URL}${path}`, {
+      method: body ? "POST" : "GET",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    if (!res.ok) throw new Error(`${path} 요청 실패 (${res.status})`);
+    return res.json();
+  };
+
   /** ---------------- 통화방 목록 불러오기 ---------------- */
   const fetchRooms = async () => {
     try {
-      const res = await fetch(`${CALL_API_URL}/call/room/list`);
-      const data = await res.json();
+      const data = await callApi("/call/room/list");
       // 백엔드가 { rooms: [...] } 형태라면
       setRooms(data.rooms || []);
     } catch (err) {
@@ -304,30 +321,29 @@ const VoiceTab: React.FC = () => {
   };
 
   const createRoom = async () => {
-    const payload = { creatorId: userEmail, roomName: "새로운 방" };
-    const res = await fetch(`${CALL_API_URL}/call/room/create`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    setCurrentRoom(data.roomId);
-    connectCallWS(data.roomId);
-    handleMicStart();
-    logSTT(`📞 통화방 생성: ${data.roomName} (${data.roomId})`);
-    fetchRooms();
+    try {
+      // 방 생성자는 서버가 JWT로 판단
+      const data = await callApi("/call/room/create", { roomName: "새로운 방" });
+      setCurrentRoom(data.id);
+      connectCallWS(data.id);
+      handleMicStart();
+      logSTT(`📞 통화방 생성: ${data.name} (${data.id})`);
+      fetchRooms();
+    } catch (err) {
+      logSTT(`❌ 통화방 생성 실패: ${(err as Error).message}`);
+    }
   };
 
   const joinRoom = async (roomId: string) => {
-    await fetch(`${CALL_API_URL}/call/room/join`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId: userEmail, roomId }),
-    });
-    setCurrentRoom(roomId);
-    connectCallWS(roomId);
-    handleMicStart();
-    logSTT(`📞 통화방 참가: ${roomId}`);
+    try {
+      await callApi("/call/room/join", { roomId });
+      setCurrentRoom(roomId);
+      connectCallWS(roomId);
+      handleMicStart();
+      logSTT(`📞 통화방 참가: ${roomId}`);
+    } catch (err) {
+      logSTT(`❌ 통화방 참가 실패: ${(err as Error).message}`);
+    }
   };
 
   /** ---------------- PCM 재생 ---------------- */
@@ -418,18 +434,17 @@ const VoiceTab: React.FC = () => {
   };
 
   const leaveRoom = async () => {
-    if (!currentRoom || !userEmail) {
+    if (!currentRoom) {
       logSTT("❌ 방 정보가 없어서 나갈 수 없음");
       return;
     }
 
+    // 통화 웹소켓을 닫아야 다른 방에 다시 접속할 수 있음
+    callWsRef.current?.close();
+    callWsRef.current = null;
+
     try {
-      const res = await fetch(`${CALL_API_URL}/call/room/leave`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: userEmail, roomId: currentRoom }),
-      });
-      const data = await res.json();
+      const data = await callApi("/call/room/leave", { roomId: currentRoom });
       logSTT(`🚪 Left room: ${JSON.stringify(data)}`);
       setCurrentRoom(null);
       fetchRooms(); // 방 목록 갱신
@@ -509,19 +524,6 @@ const VoiceTab: React.FC = () => {
       wsRef.current?.close();
       callWsRef.current?.close();
     };
-  }, []);
-
-  // 유저 이메일 저장
-  useEffect(() => {
-    const fetchUser = async () => {
-      try {
-        const me = await authService.me();
-        setUserEmail(me.email); // email을 creatorId/userId로 사용
-      } catch (err) {
-        console.error("사용자 정보 불러오기 실패", err);
-      }
-    };
-    fetchUser();
   }, []);
 
   /** ---------------- UI ---------------- */
