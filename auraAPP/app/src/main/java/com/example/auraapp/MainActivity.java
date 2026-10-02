@@ -2,8 +2,11 @@ package com.example.auraapp;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Bundle;
 import android.telephony.PhoneStateListener;
@@ -11,6 +14,7 @@ import android.telephony.TelephonyManager;
 import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.ValueCallback;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -20,8 +24,13 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import org.json.JSONObject;
+
 public class MainActivity extends AppCompatActivity {
     private static final int REQ_PERMISSIONS = 1001;
+    // 앱이 띄울 프론트엔드 주소 (예: https://aura.example.com). 이 origin에만 네이티브 기능을 허용
+    private static final String FRONTEND_URL = "[본인의 프론트엔드 주소]";
+    private final UrlPolicy urlPolicy = new UrlPolicy(FRONTEND_URL);
     private WebView webView;
     private NativeBridge nativeBridge;
     private TelephonyManager telephonyManager;
@@ -73,36 +82,50 @@ public class MainActivity extends AppCompatActivity {
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
-        // ChromeClient 설정 (마이크 권한 처리 포함)
-        chromeClient = new MyWebChromeClient(webView);
+        // ChromeClient 설정 (마이크 권한 처리 포함, 프론트엔드에만 허용)
+        chromeClient = new MyWebChromeClient(webView, urlPolicy);
         webView.setWebChromeClient(chromeClient);
+
+        // NativeBridge (프론트엔드 페이지에서만 동작)
+        nativeBridge = new NativeBridge(this, webView);
+        webView.addJavascriptInterface(nativeBridge, "Android");
 
         // WebViewClient
         webView.setWebViewClient(new WebViewClient() {
             @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                if (url != null) {
-                    // 모든 URL을 WebView에서 열도록 변경
-                    view.loadUrl(url);
-                    return true;
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+                // 프론트엔드와 소셜 로그인 페이지만 WebView에서 열기
+                if (urlPolicy.canOpenInWebView(uri)) return false;
+                // 그 외 주소(외부 링크, tel: 등)는 WebView에서 열지 않고 외부 앱으로 넘김
+                if (request.isForMainFrame() && urlPolicy.canOpenExternally(uri)) {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                    } catch (ActivityNotFoundException ignored) {
+                    }
                 }
-                return false;
+                return true;
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                // 페이지가 바뀔 때마다 네이티브 기능 허용 여부 갱신
+                nativeBridge.setTrustedPage(urlPolicy.isTrusted(url));
+                super.onPageStarted(view, url, favicon);
             }
         });
-
-        // NativeBridge
-        nativeBridge = new NativeBridge(this, webView);
-        webView.addJavascriptInterface(nativeBridge, "Android");
 
         // User-Agent 수정
         String ua = webSettings.getUserAgentString();
         webSettings.setUserAgentString(ua + " Chrome/114.0.5735.196 Mobile Safari/537.36");
 
-        // WebView 디버깅
-        WebView.setWebContentsDebuggingEnabled(true);
+        // WebView 디버깅 (디버그 빌드에서만)
+        if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            WebView.setWebContentsDebuggingEnabled(true);
+        }
 
         // URL 로드
-        webView.loadUrl("[본인의 프론트엔드 주소]");
+        webView.loadUrl(FRONTEND_URL);
 
         // 런타임 권한 체크
         checkAndRequestPermissions();
@@ -162,10 +185,14 @@ public class MainActivity extends AppCompatActivity {
     private void handleIncomingCall(Intent intent) {
         String incomingNumber = intent.getStringExtra("incomingNumber");
         if (incomingNumber != null) {
-            webView.post(() -> webView.evaluateJavascript(
-                    "window.onIncomingCall && window.onIncomingCall('" + incomingNumber + "');",
-                    null
-            ));
+            webView.post(() -> {
+                // 수신 번호는 프론트엔드 페이지에만 전달
+                if (!nativeBridge.isTrustedPage()) return;
+                webView.evaluateJavascript(
+                        "window.onIncomingCall && window.onIncomingCall(" + JSONObject.quote(incomingNumber) + ");",
+                        null
+                );
+            });
         }
     }
 
