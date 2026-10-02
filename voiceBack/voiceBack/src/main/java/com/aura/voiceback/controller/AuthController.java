@@ -3,19 +3,20 @@ package com.aura.voiceback.controller;
 import com.aura.voiceback.dto.*;
 import com.aura.voiceback.entity.User;
 import com.aura.voiceback.repository.UserRepository;
+import com.aura.voiceback.service.PasswordResetService;
 import com.aura.voiceback.service.SummaryService;
 import com.aura.voiceback.service.TokenService;
 import com.aura.voiceback.service.SocialAuthService;
 import com.aura.voiceback.service.EmailService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/auth")
@@ -28,7 +29,7 @@ public class AuthController {
     private final SocialAuthService socialAuthService;
     private final EmailService emailService;
     private final SummaryService summaryService;
-    private final Map<String, String> resetCodeStore = new ConcurrentHashMap<>();
+    private final PasswordResetService passwordResetService;
 
     // 회원가입
     @PostMapping("/register")
@@ -149,10 +150,19 @@ public class AuthController {
         User user = userRepository.findByEmail(request.getEmail())
                 .orElseThrow(() -> new RuntimeException("해당 이메일로 가입된 사용자가 없습니다."));
 
-        String code = String.format("%06d", new Random().nextInt(999999)); // 6자리 인증코드
-        resetCodeStore.put(request.getEmail(), code);
+        // 6자리 인증코드 (SecureRandom, 10분 유효, 60초 내 재요청 불가)
+        Optional<String> code = passwordResetService.issueCode(request.getEmail());
+        if (code.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("잠시 후 다시 요청해주세요.");
+        }
 
-        emailService.sendEmail(request.getEmail(), "비밀번호 재설정 코드", "인증코드: " + code);
+        try {
+            emailService.sendEmail(request.getEmail(), "비밀번호 재설정 코드",
+                    "인증코드: " + code.get() + "\n(10분간 유효합니다)");
+        } catch (RuntimeException e) {
+            passwordResetService.invalidate(request.getEmail()); // 발송 실패 시 바로 재요청할 수 있게
+            throw e;
+        }
 
         return ResponseEntity.ok("인증코드가 이메일로 전송되었습니다.");
     }
@@ -160,17 +170,21 @@ public class AuthController {
     // 2. 인증코드 확인 후 비밀번호 재설정
     @PostMapping("/password/reset/confirm")
     public ResponseEntity<String> confirmPasswordReset(@RequestBody PasswordResetConfirmRequest request) {
-        String storedCode = resetCodeStore.get(request.getEmail());
-        if (storedCode == null || !storedCode.equals(request.getCode())) {
-            return ResponseEntity.badRequest().body("잘못된 인증코드입니다.");
+        // 틀릴 때마다 시도 횟수 증가, 5번 틀리거나 만료되면 코드 폐기
+        switch (passwordResetService.verifyAndConsume(request.getEmail(), request.getCode())) {
+            case OK -> { }
+            case INVALID -> {
+                return ResponseEntity.badRequest().body("잘못된 인증코드입니다.");
+            }
+            case EXPIRED, TOO_MANY_ATTEMPTS -> {
+                return ResponseEntity.badRequest().body("인증코드가 만료되었거나 시도 횟수를 초과했습니다. 다시 요청해주세요.");
+            }
         }
 
         User user = userRepository.findByEmail(request.getEmail())
                 .orElseThrow(() -> new RuntimeException("사용자 없음"));
         user.setPassword(passwordEncoder.encode(request.getNewPassword()));
         userRepository.save(user);
-
-        resetCodeStore.remove(request.getEmail()); // 사용 후 코드 삭제
 
         return ResponseEntity.ok("비밀번호가 성공적으로 재설정되었습니다.");
     }
