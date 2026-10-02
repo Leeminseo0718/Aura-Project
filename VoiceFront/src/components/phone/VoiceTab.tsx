@@ -102,10 +102,10 @@ const VoiceTab: React.FC = () => {
           // ⚡ STT → AI 서버 POST
           sendSTTToAI({ speaker, text });
         } else if (data.spoof_prob !== undefined) {
+          // spoof_prob = 변조음성일 확률 (모델 학습 시 spoof=1, sigmoid 출력)
           const prob = data.spoof_prob;
-          const prob2 = 1 - prob;
-          console.log(prob2 * 100);
-          spoofHistoryRef.current.push(prob2);
+          console.log(prob * 100);
+          spoofHistoryRef.current.push(prob);
           if (spoofHistoryRef.current.length > 10) {
             spoofHistoryRef.current.shift();
           }
