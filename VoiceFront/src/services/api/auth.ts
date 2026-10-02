@@ -262,6 +262,9 @@ export const authService = {
   },
 };
 
+// refresh 토큰은 한 번 쓰면 교체되므로 동시에 여러 번 갱신하지 않도록 진행 중인 요청을 공유
+let refreshInFlight: Promise<string | null> | null = null;
+
 // 유효한 액세스 토큰 반환 (만료 임박 시 refresh 토큰으로 재발급)
 export const getValidAccessToken = async (): Promise<string | null> => {
   const accessToken = getStoredAccessToken();
@@ -269,10 +272,14 @@ export const getValidAccessToken = async (): Promise<string | null> => {
 
   const refreshToken = getStoredRefreshToken();
   if (!refreshToken) return accessToken;
-  try {
-    const tokens = await authService.refresh(refreshToken);
-    return tokens.accessToken;
-  } catch {
-    return null;
+  if (!refreshInFlight) {
+    refreshInFlight = authService
+      .refresh(refreshToken)
+      .then((tokens) => tokens.accessToken)
+      .catch(() => null)
+      .finally(() => {
+        refreshInFlight = null;
+      });
   }
+  return refreshInFlight;
 };

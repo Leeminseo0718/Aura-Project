@@ -94,8 +94,12 @@ public class VoIPService {
         WebSocketSession safeSession = new ConcurrentWebSocketSessionDecorator(
                 session, SEND_TIME_LIMIT_MS, SEND_BUFFER_LIMIT_BYTES,
                 ConcurrentWebSocketSessionDecorator.OverflowStrategy.DROP);
-        roomSessions.computeIfAbsent(roomId, id -> new ConcurrentHashMap<>())
-                .put(session.getId(), safeSession);
+        // removeSession이 빈 방을 지우는 것과 겹쳐도 등록이 사라지지 않도록 compute 안에서 추가
+        roomSessions.compute(roomId, (id, sessions) -> {
+            Map<String, WebSocketSession> target = sessions != null ? sessions : new ConcurrentHashMap<>();
+            target.put(session.getId(), safeSession);
+            return target;
+        });
     }
 
     public void removeSession(String roomId, String sessionId) {
