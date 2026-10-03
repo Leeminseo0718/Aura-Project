@@ -3,6 +3,9 @@ import os
 from dotenv import load_dotenv
 import re
 import time
+import asyncio
+from io import BytesIO
+import wave
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -122,6 +125,25 @@ def get_report(session_id: str, token: Optional[str] = None):
 
 
 # ======= WebSocket (binary PCM16k) =======
+def pcm16_to_wav(pcm: bytes) -> BytesIO:
+    """Wrap 16 kHz mono little-endian PCM16 in a seekable WAV container."""
+    if not pcm or len(pcm) % 2:
+        raise ValueError("PCM16 input must contain complete 16-bit samples")
+    output = BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(pcm)
+    output.seek(0)
+    return output
+
+
+def transcribe_pcm(asr_model, pcm: bytes) -> str:
+    segments, _ = asr_model.transcribe(pcm16_to_wav(pcm), language="ko", vad_filter=True)
+    return " ".join(segment.text for segment in segments)
+
+
 def _check_ws_origin(headers) -> bool:
     if WS_ALLOWED_ORIGINS == ["*"]:
         return True
@@ -159,20 +181,26 @@ async def stream(ws: WebSocket):
     try:
         while True:
             data = await ws.receive()
+            if data["type"] == "websocket.disconnect":
+                break
             if "bytes" in data and data["bytes"] is not None:
                 buf.extend(data["bytes"])
                 if len(buf) >= chunk_bytes:
                     text = ""
                     if ASR_ENABLED and model is not None:
-                        segments, _ = model.transcribe(bytes(buf), language="ko", vad_filter=True)
-                        text = " ".join(s.text for s in segments)
+                        # Keep an incomplete sample for the next frame.
+                        sample_bytes = len(buf) - len(buf) % 2
+                        text = await asyncio.to_thread(transcribe_pcm, model, bytes(buf[:sample_bytes]))
                     else:
                         # Placeholder when ASR is disabled
                         text = "(ASR 미활성화: 서버에서 전사 기능을 켜면 텍스트가 여기에 표시됩니다.)"
 
                     score = risk_score(text)
                     await ws.send_json({"sessionId": session_id, "partial": text, "risk": score, "ts": time.time()})
-                    buf.clear()
+                    if ASR_ENABLED and model is not None:
+                        del buf[:sample_bytes]
+                    else:
+                        buf.clear()
 
             elif "text" in data and data["text"] is not None:
                 if data["text"] == "__END__":
@@ -184,7 +212,8 @@ async def stream(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        await ws.close()
+        if ws.client_state.name == "CONNECTED":
+            await ws.close()
 
 
 from pydantic import BaseModel

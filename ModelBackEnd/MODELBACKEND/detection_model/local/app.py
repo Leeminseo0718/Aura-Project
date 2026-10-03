@@ -96,6 +96,8 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
 
             audio_bytes = None
             fmt = None
